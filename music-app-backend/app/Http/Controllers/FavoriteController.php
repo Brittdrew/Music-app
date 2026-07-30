@@ -17,12 +17,12 @@ class FavoriteController extends Controller
     public function toggle(Request $request)
     {
         $validatedSong = $request->validate([
-            'youtube_id' => 'required|string',
-            'title'      => 'required|string',
-            'artist'     => 'required|string',
-            'genre'      => 'nullable|string',
-            'mood'       => 'nullable|string',
-            'thumbnail'  => 'nullable|string',
+            'youtube_id' => 'required|string|max:50',
+            'title'      => 'required|string|max:255',
+            'artist'     => 'required|string|max:255',
+            'genre'      => 'nullable|string|max:100',
+            'mood'       => 'nullable|string|max:100',
+            'thumbnail'  => 'nullable|url|max:500',
         ]);
 
         $song = Song::firstOrCreate(

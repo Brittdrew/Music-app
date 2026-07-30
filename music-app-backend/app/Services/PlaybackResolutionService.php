@@ -13,7 +13,7 @@ class PlaybackResolutionService
 
     public function __construct()
     {
-        $this->youtubeKey = env('VITE_YOUTUBE_API_KEY') ?? env('YOUTUBE_API_KEY');
+        $this->youtubeKey = config('services.youtube.key');
     }
 
     /**

@@ -50,7 +50,15 @@ class SongController extends Controller
         if ($song->user_id !== auth()->id()) {
             return response()->json(['message' => 'Forbidden'], 403);
         }
-        $song->update($request->all());
+        $validated = $request->validate([
+            'title'      => 'sometimes|string|max:255',
+            'artist'     => 'sometimes|string|max:255',
+            'genre'      => 'nullable|string|max:100',
+            'mood'       => 'nullable|string|max:100',
+            'thumbnail'  => 'nullable|url|max:500',
+            'youtube_id' => 'sometimes|string|max:50',
+        ]);
+        $song->update($validated);
         return response()->json($song);
     }
 

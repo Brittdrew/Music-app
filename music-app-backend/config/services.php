@@ -40,5 +40,9 @@ return [
         'client_secret' => env('GOOGLE_CLIENT_SECRET'),
     ],
 
+    'youtube' => [
+        'key' => env('YOUTUBE_API_KEY'),
+    ],
+
 ];
 

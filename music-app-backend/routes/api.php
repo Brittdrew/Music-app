@@ -8,10 +8,12 @@ use App\Http\Controllers\PreferenceController;
 use App\Http\Controllers\ItunesController;
 use App\Http\Controllers\FavoriteController;
 
-// Auth (public)
-Route::post('/register',    [AuthController::class, 'register']);
-Route::post('/login',       [AuthController::class, 'login']);
-Route::post('/auth/google', [AuthController::class, 'googleLogin']);
+// Auth (public) — rate-limited to 10 requests/min to prevent brute force
+Route::middleware('throttle:10,1')->group(function () {
+    Route::post('/register',    [AuthController::class, 'register']);
+    Route::post('/login',       [AuthController::class, 'login']);
+    Route::post('/auth/google', [AuthController::class, 'googleLogin']);
+});
 
 // All protected routes (require login)
 Route::middleware('auth:sanctum')->group(function () {
