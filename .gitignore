@@ -1,0 +1,25 @@
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+vendor/
+
+# Build output
+dist/
+dist-ssr/
+public/build/
+public/hot
+
+# Logs and caches
+*.log
+.phpunit.result.cache
+.phpunit.cache/
+
+# Editors and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
