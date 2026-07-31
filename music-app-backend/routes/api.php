@@ -1,12 +1,33 @@
 <?php
 
 use Illuminate\Support\Facades\Route;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Http\Request;
 use App\Http\Controllers\AuthController;
 use App\Http\Controllers\SongController;
 use App\Http\Controllers\PlaylistController;
 use App\Http\Controllers\PreferenceController;
 use App\Http\Controllers\ItunesController;
 use App\Http\Controllers\FavoriteController;
+
+// Public proxy routes for LRCLIB lyrics (no auth required — avoids CORS + Cloudflare blocks)
+Route::get('/lyrics/search', function (Request $request) {
+    $response = Http::withHeaders([
+        'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept'     => 'application/json',
+    ])->get('https://lrclib.net/api/search', $request->query());
+
+    return response()->json($response->json() ?? [], $response->status());
+});
+
+Route::get('/lyrics/get', function (Request $request) {
+    $response = Http::withHeaders([
+        'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept'     => 'application/json',
+    ])->get('https://lrclib.net/api/get', $request->query());
+
+    return response()->json($response->json() ?? [], $response->status());
+});
 
 // Auth (public) — rate-limited to 10 requests/min to prevent brute force
 Route::middleware('throttle:10,1')->group(function () {

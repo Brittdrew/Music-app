@@ -9,7 +9,7 @@ import { useFavorites } from '../context/FavoritesContext'
 function parseLRC(lrc) {
     const lines = lrc.split('\n')
     const result = []
-    const timeRegex = /\[(\d+):(\d+\.\d+)\]/
+    const timeRegex = /\[(\d+):(\d+\.\d+|\d+)\]/
     for (const line of lines) {
         const match = line.match(timeRegex)
         if (match) {
@@ -21,6 +21,26 @@ function parseLRC(lrc) {
         }
     }
     return result
+}
+
+function parsePlainLyricsToTimed(plainText, songDuration) {
+    if (!plainText || plainText === 'Lyrics not found for this song.') return []
+    const lines = plainText
+        .split('\n')
+        .map(l => l.trim())
+        .filter(Boolean)
+
+    if (!lines.length) return []
+    const dur = songDuration > 0 ? songDuration : 180
+    const startTime = Math.min(3, dur * 0.04)
+    const effectiveDur = Math.max(10, dur - startTime - 5)
+    const timePerLine = effectiveDur / lines.length
+
+    return lines.map((text, idx) => ({
+        time: startTime + idx * timePerLine,
+        text,
+        isEstimated: true,
+    }))
 }
 
 function VinylDisc({ song, isPlaying }) {
@@ -169,6 +189,9 @@ export default function Player() {
     const [syncedLyrics, setSyncedLyrics] = useState([])
     const [plainLyrics, setPlainLyrics] = useState('')
     const [loadingLyrics, setLoadingLyrics] = useState(true)
+    const activeLyrics = syncedLyrics.length > 0
+        ? syncedLyrics
+        : parsePlainLyricsToTimed(plainLyrics, duration)
     // Raw lrclib results — held until we know the real YouTube duration so we
     // can pick the entry whose duration best matches the actual video length.
     const [lyricsResults, setLyricsResults] = useState([])
@@ -186,6 +209,7 @@ export default function Player() {
     const userScrollTimeoutRef = useRef(null)
     const scrollRafRef = useRef(null)
     const [mobileLyricsExpanded, setMobileLyricsExpanded] = useState(false)
+    const [lyricsOffset, setLyricsOffset] = useState(0) // manual ±s shift to fix intro drift
 
     const handleScroll = () => {
         setUserScrolling(true)
@@ -393,14 +417,29 @@ export default function Player() {
     }, [currentSong, id])
 
     // Redirect handler: updates the URL when the active song changes (e.g. queue progression)
-    // or when the song finishes resolving its YouTube ID.
     useEffect(() => {
         if (currentSong && currentSong.youtube_id && String(currentSong.youtube_id) !== String(id)) {
             navigate(`/player/${currentSong.youtube_id}`, { replace: true })
         }
     }, [currentSong, id, navigate])
 
+    // Re-fetch lyrics whenever the active song's artist or title changes
+    const fetchedTrackRef = useRef('')
+    useEffect(() => {
+        if (!song?.artist && !song?.title) return
+        const key = `${song.youtube_id || song.id}_${song.artist}_${song.title}`
+        if (fetchedTrackRef.current === key) return
+        fetchedTrackRef.current = key
+        fetchLyrics(song.artist, song.title)
+    }, [song?.artist, song?.title, song?.youtube_id, song?.id])
+
     const fetchLyrics = async (artist, title) => {
+        if (!artist && !title) {
+            setLoadingLyrics(false)
+            setPlainLyrics('Lyrics not available')
+            return
+        }
+
         setLoadingLyrics(true)
         setSyncedLyrics([])
         setPlainLyrics('')
@@ -412,56 +451,110 @@ export default function Player() {
                 .replace(/\[.*?\]/g, '')
                 .replace(/ft\..*$/i, '')
                 .replace(/feat\..*$/i, '')
+                .replace(/official\s+music\s+video/gi, '')
                 .replace(/official\s+video/gi, '')
                 .replace(/official\s+audio/gi, '')
                 .replace(/lyric\s+video/gi, '')
                 .replace(/lyrics/gi, '')
+                .replace(/remastered/gi, '')
+                .replace(/\s+/g, ' ')
                 .trim()
         }
 
-        let parsedArtist = artist || ''
-        let parsedTitle = title || ''
+        let parsedArtist = (artist || '').trim()
+        let parsedTitle = (title || '').trim()
 
         // Clean VEVO or Topic suffixes from channel name
         if (parsedArtist.toLowerCase().endsWith('vevo')) {
-            parsedArtist = parsedArtist.slice(0, -4)
+            parsedArtist = parsedArtist.slice(0, -4).trim()
         }
-        if (parsedArtist.toLowerCase().endsWith(' - topic')) {
-            const idx = parsedArtist.toLowerCase().indexOf(' - topic')
-            parsedArtist = parsedArtist.substring(0, idx)
+        if (parsedArtist.toLowerCase().includes('- topic')) {
+            parsedArtist = parsedArtist.replace(/- topic/gi, '').trim()
         }
 
-        // If title contains a hyphen, extract artist and title from it
-        if (title && title.includes('-')) {
-            const parts = title.split('-')
-            parsedArtist = parts[0].trim()
-            parsedTitle = parts.slice(1).join('-').trim()
+        // Handle titles like "Artist - Title" vs "Title - Extra Info"
+        if (parsedTitle.includes('-')) {
+            const parts = parsedTitle.split('-')
+            const part0 = parts[0].trim()
+            const part1 = parts.slice(1).join('-').trim()
+
+            // If parsedArtist is missing or generic, or part0 matches parsedArtist
+            if (!parsedArtist || parsedArtist.toLowerCase().includes(part0.toLowerCase()) || part0.toLowerCase().includes(parsedArtist.toLowerCase())) {
+                parsedArtist = part0
+                parsedTitle = part1
+            } else {
+                // part0 is likely the actual title, part1 is extra info (e.g. "Remastered", "Single", etc.)
+                parsedTitle = part0
+            }
         }
 
         const cleanArtist = cleanString(parsedArtist)
         const cleanTitle = cleanString(parsedTitle)
 
+        // Try LRCLIB: 1. Strict search by artist + track
         try {
-            const res = await fetch(`https://lrclib.net/api/search?artist_name=${encodeURIComponent(cleanArtist)}&track_name=${encodeURIComponent(cleanTitle)}`)
-            const data = await res.json()
-            if (data.length > 0) {
-                // Store ALL results. A separate useEffect picks the best entry once
-                // the YouTube player has reported the actual video duration, so we
-                // can match the LRC that was calibrated for the same version.
-                // (e.g. 188s studio audio vs 256s music video of "Treat You Better")
-                setLyricsResults(data)
-                setLoadingLyrics(false)
-                return
+            if (cleanArtist && cleanTitle) {
+                const res = await api.get('/lyrics/search', { params: { artist_name: cleanArtist, track_name: cleanTitle } })
+                if (Array.isArray(res.data) && res.data.length > 0) {
+                    setLyricsResults(res.data)
+                    setLoadingLyrics(false)
+                    return
+                }
             }
         } catch { }
 
+        // Try LRCLIB: 2. Combined query search ('q')
         try {
-            const res = await fetch(`https://api.lyrics.ovh/v1/${encodeURIComponent(cleanArtist)}/${encodeURIComponent(cleanTitle)}`)
-            const data = await res.json()
-            if (data.lyrics) {
-                setPlainLyrics(data.lyrics)
-                setLoadingLyrics(false)
-                return
+            const query = `${cleanArtist} ${cleanTitle}`.trim()
+            if (query) {
+                const res = await api.get('/lyrics/search', { params: { q: query } })
+                if (Array.isArray(res.data) && res.data.length > 0) {
+                    setLyricsResults(res.data)
+                    setLoadingLyrics(false)
+                    return
+                }
+            }
+        } catch { }
+
+        // Try LRCLIB: 3. Search by track title only
+        try {
+            if (cleanTitle && cleanTitle.length > 2) {
+                const res = await api.get('/lyrics/search', { params: { q: cleanTitle } })
+                if (Array.isArray(res.data) && res.data.length > 0) {
+                    setLyricsResults(res.data)
+                    setLoadingLyrics(false)
+                    return
+                }
+            }
+        } catch { }
+
+        // Fallback: lyrics.ovh (clean artist & title)
+        try {
+            if (cleanArtist && cleanTitle) {
+                const res = await fetch(`https://api.lyrics.ovh/v1/${encodeURIComponent(cleanArtist)}/${encodeURIComponent(cleanTitle)}`)
+                if (res.ok) {
+                    const data = await res.json()
+                    if (data.lyrics) {
+                        setPlainLyrics(data.lyrics)
+                        setLoadingLyrics(false)
+                        return
+                    }
+                }
+            }
+        } catch { }
+
+        // Fallback: lyrics.ovh (raw artist & title)
+        try {
+            if (artist && title) {
+                const res = await fetch(`https://api.lyrics.ovh/v1/${encodeURIComponent(artist)}/${encodeURIComponent(title)}`)
+                if (res.ok) {
+                    const data = await res.json()
+                    if (data.lyrics) {
+                        setPlainLyrics(data.lyrics)
+                        setLoadingLyrics(false)
+                        return
+                    }
+                }
             }
         } catch { }
 
@@ -471,8 +564,8 @@ export default function Player() {
 
     // Pick the best lrclib entry by matching its stored duration to the YouTube
     // player's actual video duration. This fires:
-    //   1. Immediately when results arrive (uses whatever duration is available)
-    //   2. Once more when duration transitions 0 → real value (re-picks with truth)
+    //   1. When results arrive (waits if duration not yet known)
+    //   2. Once more when duration transitions 0 → real value (picks with truth)
     // The durationMatchedRef prevents re-picking on every 250ms polling tick.
     const hasDuration = duration > 0
     useEffect(() => {
@@ -482,29 +575,30 @@ export default function Player() {
         const plain = lyricsResults.find(e => e.plainLyrics)
 
         if (synced.length === 0) {
-            // No synced entry at all — use plain text
+            // No synced entry at all — use plain text immediately
             if (plain) { setSyncedLyrics([]); setPlainLyrics(plain.plainLyrics) }
             durationMatchedRef.current = true
             return
         }
 
-        // If duration is known, find the synced entry whose stored duration is
-        // closest to the YouTube video's real length. Otherwise fall back to the
-        // first available synced entry as a placeholder until duration arrives.
-        const best = hasDuration
-            ? synced.reduce((a, b) =>
-                Math.abs(a.duration - duration) <= Math.abs(b.duration - duration) ? a : b
-            )
-            : synced[0]
+        // Wait until we have a real video duration (> 10s) before picking
+        // so we always match against the actual YouTube track length.
+        if (duration <= 10) return
+
+        console.log('LYRICS PICK — video duration:', duration, 'lrc entries:', synced.map(e => e.duration))
+
+        const best = synced.reduce((a, b) =>
+            Math.abs(a.duration - duration) <= Math.abs(b.duration - duration) ? a : b
+        )
 
         setSyncedLyrics(parseLRC(best.syncedLyrics))
         setPlainLyrics('')
-        if (hasDuration) durationMatchedRef.current = true
+        durationMatchedRef.current = true
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [lyricsResults, hasDuration])
+    }, [lyricsResults, duration])
 
     useEffect(() => {
-        setCurrentLine(0); setSyncedLyrics([]); setPlainLyrics(''); setLoadingLyrics(true)
+        setCurrentLine(0); setSyncedLyrics([]); setPlainLyrics(''); setLoadingLyrics(true); setMobileLyricsExpanded(false)
         setLyricsResults([])         // clear stored results so the picker resets
         durationMatchedRef.current = false  // allow one re-pick once duration is known
         const isMatch = currentSong && (
@@ -529,19 +623,19 @@ export default function Player() {
     }, [id])
 
     useEffect(() => {
-        if (!syncedLyrics.length) return
+        if (!activeLyrics.length) return
         let idx = 0
-        for (let i = 0; i < syncedLyrics.length; i++) {
-            if (currentTime >= syncedLyrics[i].time) idx = i
+        for (let i = 0; i < activeLyrics.length; i++) {
+            if (currentTime >= activeLyrics[i].time) idx = i
         }
 
         if (idx !== currentLine) {
             setCurrentLine(idx)
         }
-    }, [currentTime, syncedLyrics, currentLine])
+    }, [currentTime, activeLyrics, currentLine])
 
     useEffect(() => {
-        if (userScrolling || !syncedLyrics.length) return
+        if (userScrolling || !activeLyrics.length) return
 
         // Normal (non-fullscreen) lyrics panel — Apple-style smooth RAF easing
         const elNorm = lineRefs.current[currentLine]
@@ -564,7 +658,7 @@ export default function Player() {
             const targetScrollTop = elTop - containerHeight / 2 + elHeight / 2
             smoothScrollTo(container, targetScrollTop, 520)
         }
-    }, [currentLine, userScrolling, syncedLyrics, smoothScrollTo])
+    }, [currentLine, userScrolling, activeLyrics, smoothScrollTo])
 
     useEffect(() => {
         return () => {
@@ -577,7 +671,7 @@ export default function Player() {
     // Enter/exit native browser fullscreen in sync with our immersive view,
     // matching Spotify's behavior where the browser chrome fully disappears.
     useEffect(() => {
-        if (fullscreen) {
+        if (fullscreen && !isMobile) {
             // Request native browser fullscreen (hides address bar, tabs, taskbar)
             if (document.documentElement.requestFullscreen && !document.fullscreenElement) {
                 document.documentElement.requestFullscreen().catch(() => {})
@@ -601,7 +695,7 @@ export default function Player() {
         return () => {
             document.removeEventListener('fullscreenchange', onFsChange)
         }
-    }, [fullscreen])
+    }, [fullscreen, isMobile])
 
     // Desktop fullscreen: lyrics visible by default; toggle switches to queue view.
     useEffect(() => {
@@ -684,8 +778,8 @@ export default function Player() {
                 }
             `}</style>
 
-            {/* FULLSCREEN OVERLAY */}
-            {fullscreen && (
+            {/* FULLSCREEN OVERLAY (Desktop only) */}
+            {fullscreen && !isMobile && (
                 <div style={{
                     position: 'fixed', inset: 0, zIndex: 999,
                     display: 'flex', flexDirection: 'column',
@@ -814,9 +908,9 @@ export default function Player() {
                                                 <div key={i} className="skeleton" style={{ height: '24px', width: `${45 + (i % 3) * 18}%`, borderRadius: '6px' }} />
                                             ))}
                                         </div>
-                                    ) : syncedLyrics.length > 0 ? (
+                                    ) : activeLyrics.length > 0 ? (
                                         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                                            {syncedLyrics.map((line, i) => {
+                                            {activeLyrics.map((line, i) => {
                                                 const isActive = i === currentLine
                                                 return (
                                                     <p
@@ -841,13 +935,8 @@ export default function Player() {
                                                 )
                                             })}
                                         </div>
-                                    ) : plainLyrics === 'Lyrics not found for this song.' ? (
-                                        <p style={{ color: 'rgba(255,255,255,0.35)', fontSize: '22px', fontWeight: '600', textAlign: 'center', marginTop: '60px' }}>Lyrics not available</p>
                                     ) : (
-                                        <pre style={{
-                                            whiteSpace: 'pre-wrap', color: 'rgba(255,255,255,0.45)',
-                                            fontSize: '20px', lineHeight: '1.6', fontFamily: 'inherit', fontWeight: '600',
-                                        }}>{plainLyrics}</pre>
+                                        <p style={{ color: 'rgba(255,255,255,0.35)', fontSize: '22px', fontWeight: '600', textAlign: 'center', marginTop: '60px' }}>Lyrics not available</p>
                                     )}
                                 </div>
 
@@ -1669,9 +1758,9 @@ export default function Player() {
                                                             <div key={i} className="skeleton" style={{ height: '24px', width: `${45 + (i % 3) * 18}%`, borderRadius: '6px' }} />
                                                         ))}
                                                     </div>
-                                                ) : syncedLyrics.length > 0 ? (
+                                                ) : activeLyrics.length > 0 ? (
                                                     <>
-                                                        {currentLine === 0 && currentTime < syncedLyrics[0].time && (
+                                                        {currentLine === 0 && currentTime < activeLyrics[0].time && (
                                                             <div style={{ display: 'flex', gap: '6px', marginBottom: '16px' }}>
                                                                 {[0, 1, 2].map(i => (
                                                                     <span key={i} style={{
@@ -1682,7 +1771,7 @@ export default function Player() {
                                                                 ))}
                                                             </div>
                                                         )}
-                                                        {syncedLyrics.map((line, i) => {
+                                                        {activeLyrics.map((line, i) => {
                                                             const isActive = i === currentLine
                                                             // Distance-based opacity: active=1, ±1=0.55, ±2=0.32, ±3+=0.14
                                                             const dist = Math.abs(i - currentLine)
@@ -1726,13 +1815,8 @@ export default function Player() {
                                                             )
                                                         })}
                                                     </>
-                                                ) : plainLyrics === 'Lyrics not found for this song.' ? (
-                                                    <p style={{ color: 'rgba(255,255,255,0.35)', fontSize: '24px', fontWeight: '600' }}>Lyrics not available</p>
                                                 ) : (
-                                                    <pre style={{
-                                                        whiteSpace: 'pre-wrap', color: 'rgba(255,255,255,0.45)',
-                                                        fontSize: '22px', lineHeight: '1.5', fontFamily: 'inherit', fontWeight: '600',
-                                                    }}>{plainLyrics}</pre>
+                                                    <p style={{ color: 'rgba(255,255,255,0.35)', fontSize: '24px', fontWeight: '600' }}>Lyrics not available</p>
                                                 )}
                                             </div>
                                         </div>
@@ -2027,7 +2111,7 @@ export default function Player() {
                             </div>
                         </div>
 
-                        {/* Lyrics Preview Card */}
+                        {/* Lyrics Card (Inline Mobile Expansion) */}
                         <div style={{
                             background: `rgba(${pr}, ${pg}, ${pb}, 0.18)`,
                             borderRadius: 'var(--radius-xl)',
@@ -2041,50 +2125,88 @@ export default function Player() {
                             boxShadow: `0 8px 30px rgba(${pr}, ${pg}, ${pb}, 0.08)`,
                             flexShrink: 0,
                             overflow: 'hidden',
+                            transition: 'all 0.3s ease',
                         }}>
-                            <p style={{ fontSize: '11px', fontWeight: '800', letterSpacing: '1.5px', color: 'rgba(255,255,255,0.5)', textTransform: 'uppercase', margin: 0 }}>Lyrics preview</p>
+                            <p style={{ fontSize: '11px', fontWeight: '800', letterSpacing: '1.5px', color: 'rgba(255,255,255,0.5)', textTransform: 'uppercase', margin: 0 }}>
+                                {mobileLyricsExpanded ? 'Lyrics' : 'Lyrics preview'}
+                            </p>
 
                             {loadingLyrics ? (
                                 <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
                                     {Array.from({ length: 4 }).map((_, i) => <div key={i} className="skeleton" style={{ height: '18px', width: `${55 + i * 9}%`, borderRadius: '4px' }} />)}
                                 </div>
-                            ) : syncedLyrics.length > 0 ? (
-                                /* Live synced lyrics preview — window of lines from currentLine */
-                                <div style={{
-                                    display: 'flex', flexDirection: 'column', gap: '6px',
-                                    maskImage: 'linear-gradient(to bottom, white 55%, transparent 100%)',
-                                    WebkitMaskImage: 'linear-gradient(to bottom, white 55%, transparent 100%)',
-                                }}>
-                                    {syncedLyrics.slice(Math.max(0, currentLine), Math.min(syncedLyrics.length, Math.max(0, currentLine) + 5)).map((line, idx) => {
-                                        const isActive = idx === 0
-                                        return (
-                                            <p key={Math.max(0, currentLine) + idx} style={{
-                                                fontSize: isActive ? '17px' : '15px',
-                                                fontWeight: isActive ? '800' : '600',
-                                                color: isActive ? '#fff' : 'rgba(255,255,255,0.5)',
-                                                lineHeight: '1.55',
-                                                margin: 0,
-                                                transition: 'font-size 0.35s ease, color 0.35s ease',
-                                                willChange: 'font-size, color',
-                                            }}>{line.text}</p>
-                                        )
-                                    })}
-                                </div>
-                            ) : plainLyrics && plainLyrics !== 'Lyrics not found for this song.' ? (
-                                <pre style={{
-                                    whiteSpace: 'pre-wrap', color: 'rgba(255,255,255,0.7)',
-                                    fontSize: '15px', lineHeight: '1.6', fontFamily: 'inherit',
-                                    fontWeight: '600', margin: 0, maxHeight: '110px', overflow: 'hidden',
-                                    maskImage: 'linear-gradient(to bottom, white 55%, transparent 100%)',
-                                    WebkitMaskImage: 'linear-gradient(to bottom, white 55%, transparent 100%)',
-                                }}>{plainLyrics}</pre>
+                            ) : activeLyrics.length > 0 ? (
+                                mobileLyricsExpanded ? (
+                                    /* Full inline scrollable synced lyrics on mobile */
+                                    <div
+                                        ref={lyricsRef}
+                                        onScroll={handleScroll}
+                                        style={{
+                                            maxHeight: '380px',
+                                            overflowY: 'auto',
+                                            display: 'flex',
+                                            flexDirection: 'column',
+                                            gap: '2px',
+                                            paddingRight: '6px',
+                                            scrollBehavior: 'smooth',
+                                            maskImage: 'linear-gradient(to bottom, transparent 0%, black 16px, black calc(100% - 24px), transparent 100%)',
+                                            WebkitMaskImage: 'linear-gradient(to bottom, transparent 0%, black 16px, black calc(100% - 24px), transparent 100%)',
+                                        }}
+                                    >
+                                        <div style={{ paddingTop: '16px', paddingBottom: '160px' }}>
+                                            {activeLyrics.map((line, i) => {
+                                                const isActive = i === currentLine
+                                                return (
+                                                    <p
+                                                        key={i}
+                                                        ref={el => lineRefs.current[i] = el}
+                                                        onClick={() => handleLyricClick(line.time)}
+                                                        style={{
+                                                            fontSize: isActive ? '19px' : '15px',
+                                                            fontWeight: isActive ? '800' : '500',
+                                                            color: isActive ? '#fff' : i < currentLine ? 'rgba(255,255,255,0.25)' : 'rgba(255,255,255,0.5)',
+                                                            lineHeight: '1.55',
+                                                            margin: '8px 0',
+                                                            cursor: 'pointer',
+                                                            transition: 'font-size 0.35s ease, color 0.35s ease',
+                                                        }}
+                                                    >
+                                                        {line.text}
+                                                    </p>
+                                                )
+                                            })}
+                                        </div>
+                                    </div>
+                                ) : (
+                                    /* Live synced lyrics preview — window of lines from currentLine */
+                                    <div style={{
+                                        display: 'flex', flexDirection: 'column', gap: '6px',
+                                        maskImage: 'linear-gradient(to bottom, white 55%, transparent 100%)',
+                                        WebkitMaskImage: 'linear-gradient(to bottom, white 55%, transparent 100%)',
+                                    }}>
+                                        {activeLyrics.slice(Math.max(0, currentLine), Math.min(activeLyrics.length, Math.max(0, currentLine) + 5)).map((line, idx) => {
+                                            const isActive = idx === 0
+                                            return (
+                                                <p key={Math.max(0, currentLine) + idx} style={{
+                                                    fontSize: isActive ? '17px' : '15px',
+                                                    fontWeight: isActive ? '800' : '600',
+                                                    color: isActive ? '#fff' : 'rgba(255,255,255,0.5)',
+                                                    lineHeight: '1.55',
+                                                    margin: 0,
+                                                    transition: 'font-size 0.35s ease, color 0.35s ease',
+                                                    willChange: 'font-size, color',
+                                                }}>{line.text}</p>
+                                            )
+                                        })}
+                                    </div>
+                                )
                             ) : (
                                 <p style={{ color: 'rgba(255,255,255,0.4)', fontSize: '14px', fontWeight: '500', margin: 0 }}>Lyrics not available</p>
                             )}
 
                             {(syncedLyrics.length > 0 || (plainLyrics && plainLyrics !== 'Lyrics not found for this song.')) && (
                                 <button
-                                    onClick={() => setFullscreen(true)}
+                                    onClick={() => setMobileLyricsExpanded(prev => !prev)}
                                     style={{
                                         alignSelf: 'flex-start',
                                         background: 'rgba(255,255,255,0.18)',
@@ -2101,7 +2223,7 @@ export default function Player() {
                                     onMouseEnter={e => e.currentTarget.style.background = 'rgba(255,255,255,0.28)'}
                                     onMouseLeave={e => e.currentTarget.style.background = 'rgba(255,255,255,0.18)'}
                                 >
-                                    Show lyrics
+                                    {mobileLyricsExpanded ? 'Show less' : 'Show lyrics'}
                                 </button>
                             )}
                         </div>

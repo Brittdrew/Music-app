@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
+import api from '../api/axios'
 
 // Parses standard LRC "[mm:ss.xx]text" lines into { time, text }[]
 function parseLRC(lrcText) {
@@ -50,33 +51,29 @@ export function useLyrics(song) {
         const cleanTitle = song.title.replace(/\(.*?\)|\[.*?\]/g, '').trim()
 
         async function fetchLyrics() {
-            // ── Primary: lrclib.net ──
+            // ── Primary: lrclib.net (via Laravel proxy to avoid CORS/Cloudflare) ──
             try {
-                const params = new URLSearchParams({
-                    track_name: cleanTitle,
-                    artist_name: song.artist,
+                const res = await api.get('/lyrics/get', {
+                    params: { track_name: cleanTitle, artist_name: song.artist }
                 })
-                const res = await fetch(`https://lrclib.net/api/get?${params}`)
-                if (res.ok) {
-                    const data = await res.json()
-                    if (myRequestId !== requestIdRef.current) return
-                    if (data.syncedLyrics) {
-                        setLyrics(parseLRC(data.syncedLyrics))
-                        setIsSynced(true)
-                        setIsLoading(false)
-                        return
-                    }
-                    if (data.plainLyrics) {
-                        setLyrics(
-                            data.plainLyrics
-                                .split('\n')
-                                .filter(l => l.trim())
-                                .map(text => ({ time: -1, text }))
-                        )
-                        setIsSynced(false)
-                        setIsLoading(false)
-                        return
-                    }
+                const data = res.data
+                if (myRequestId !== requestIdRef.current) return
+                if (data.syncedLyrics) {
+                    setLyrics(parseLRC(data.syncedLyrics))
+                    setIsSynced(true)
+                    setIsLoading(false)
+                    return
+                }
+                if (data.plainLyrics) {
+                    setLyrics(
+                        data.plainLyrics
+                            .split('\n')
+                            .filter(l => l.trim())
+                            .map(text => ({ time: -1, text }))
+                    )
+                    setIsSynced(false)
+                    setIsLoading(false)
+                    return
                 }
             } catch {
                 // fall through to fallback source
